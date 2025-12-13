@@ -259,7 +259,7 @@ _G.EnableNetLib = false
 _G.wackyhead = false -- changes non pd alot
 _G.BodyForceEnabled = true
 _G.FasterLoad = true -- loads perma instantly (kinda) but is really buggy
-_G.R15toR6 = false -- no settings work
+_G.R15toR6 = true -- no settings work
 
 	local c = game:GetService("Players").LocalPlayer.Character
 	_G.OxideRealChar = c
