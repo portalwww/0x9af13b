@@ -1,93 +1,185 @@
--- Clean VR Hat Script (December 2025) - Fixed drop position & alignment
+-- Fixed SkyVR Hatdrop (Compatible with v8.1 Loader - Dec 2025)
+-- Fixes: Velocity in Align (no falling), proper headhats cf lookup (name/meshid), networkowner, CFrame deprecation, movementSpeed, loco offsets, toy binds, outlines, error handling
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
 local Workspace = game.Workspace
 
 local Player = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
+local PostSimulation = RunService.PostSimulation
+local RenderStepped = RunService.RenderStepped
 
--- === OPTIONS (edit these) ===
-getgenv().options = getgenv().options or {
-    headscale = 1,
-    lefthandrotoffset = Vector3.new(0, 0, 0),
-    righthandrotoffset = Vector3.new(0, 0, 0),
-    controllerRotationOffset = Vector3.new(0, 0, 0),
-    leftToyBind = Enum.KeyCode.ButtonL2,
-    rightToyBind = Enum.KeyCode.ButtonR2,
-    HeadHatTransparency = 1,
-}
+local options = getgenv().options or {}
+local headhats = getgenv().headhats or {}
+local leftHat = getgenv().left or ""
+local rightHat = getgenv().right or ""
 
--- Your hat configurations (example format)
-getgenv().headhats = getgenv().headhats or {}  -- e.g. ["Dominus"] = CFrame.new(0,0.5,0)
-getgenv().left = getgenv().left or nil         -- "HatName" or "meshid:123456"
-getgenv().right = getgenv().right or nil
+-- Defaults if missing
+options.NetVelocity = options.NetVelocity or Vector3.new(20, 20, 20)
+options.headscale = options.headscale or 6.5
+options.HeadHatTransparency = options.HeadHatTransparency or 1
+options.lefthandrotoffset = options.lefthandrotoffset or Vector3.new(0, 90, 0)
+options.righthandrotoffset = options.righthandrotoffset or Vector3.new(0, 90, 0)
+options.controllerRotationOffset = options.controllerRotationOffset or Vector3.new(0, 0, 0)
+options.leftToyBind = options.leftToyBind or Enum.KeyCode.ButtonY
+options.rightToyBind = options.rightToyBind or Enum.KeyCode.ButtonB
+options.leftToy = options.leftToy or ""
+options.rightToy = options.rightToy or ""
+options.movementSpeed = options.movementSpeed or 1
+options.locomotionSpeed = options.locomotionSpeed or 0.5
+options.locomotionSmoothing = options.locomotionSmoothing or 0.5
+options.outlinesEnabled = options.outlinesEnabled or false
 
--- === Create alignment parts ===
-local function CreateAlignPart(name, size, anchored)
+Workspace.FallenPartsDestroyHeight = 0 / 0
+
+-- Create target parts
+local function createPart(size, name, highlight)
     local part = Instance.new("Part")
     part.Name = name
-    part.Size = size or Vector3.new(1,1,1)
+    part.Size = size
     part.Transparency = 1
     part.CanCollide = false
-    part.Anchored = anchored or false
+    part.Anchored = true
     part.Parent = Workspace
+    if Player.Character and Player.Character:FindFirstChild("HumanoidRootPart") then
+        part.CFrame = Player.Character.HumanoidRootPart.CFrame
+    else
+        part.CFrame = CFrame.new(0, 10, 0)
+    end
+    if highlight and options.outlinesEnabled then
+        local sel = Instance.new("SelectionBox")
+        sel.Adornee = part
+        sel.LineThickness = 0.05
+        sel.Parent = part
+    end
     return part
 end
 
-local LeftHandPart  = CreateAlignPart("LeftHandAlign",  Vector3.new(2,1,1))
-local RightHandPart = CreateAlignPart("RightHandAlign", Vector3.new(2,1,1))
-local HeadPart      = CreateAlignPart("HeadAlign",      Vector3.new(1,1,1))
-local LeftToyPart   = CreateAlignPart("LeftToy",        Vector3.new(1,1,1))
-local RightToyPart  = CreateAlignPart("RightToy",       Vector3.new(1,1,1))
+local leftHandPart = createPart(Vector3.new(2, 1, 1), "moveLH", true)
+local rightHandPart = createPart(Vector3.new(2, 1, 1), "moveRH", true)
+local headPart = createPart(Vector3.new(1, 1, 1), "moveH", false)
+local leftToyPart = createPart(Vector3.new(1, 1, 1), "LToy", true)
+local rightToyPart = createPart(Vector3.new(1, 1, 1), "RToy", true)
 
-local parts = {
-    left = LeftHandPart,
-    right = RightHandPart,
-    headhats = HeadPart,
-    leftToy = LeftToyPart,
-    rightToy = RightToyPart,
-}
+local leftToyEnabled = false
+local rightToyEnabled = false
+local lFirst = true
+local rFirst = true
+local lToyPos = CFrame.new(1.15, 0, 0) * CFrame.Angles(0, math.rad(180), 0)
+local rToyPos = CFrame.new(1.15, 0, 0)
 
--- Toy toggles
-local leftToyEnabled, rightToyEnabled = false, false
-local leftToyCF, rightToyCF = CFrame.new(1.15, 0, 0) * CFrame.Angles(0, math.rad(180), 0), CFrame.new(1.15, 0, 0)
+local R1down = false
+local R2down = false  -- If needed for fling
 
--- === Network ownership check ===
-local function IsNetworkOwner(part)
-    return part and part.ReceiveAge == 0
+-- Filter MeshID
+local function filterMeshID(id)
+    return (string.find(id, 'assetdelivery') and string.match(string.sub(id, 37), "%d+")) or string.match(id, "%d+")
 end
 
--- === Align function ===
-local function Align(handle, alignPart, offsetCF, isFlingPart)
-    offsetCF = offsetCF or CFrame.new()
-    local velocity = Vector3.new(20, 20, 20)
+-- Find by MeshID
+local function findMeshID(id)
+    for k, v in pairs(headhats) do
+        if k == "meshid:" .. id then
+            return true, headPart, v
+        end
+    end
+    if rightHat == "meshid:" .. id then
+        return true, rightHandPart, CFrame.new()
+    end
+    if leftHat == "meshid:" .. id then
+        return true, leftHandPart, CFrame.new()
+    end
+    if options.leftToy == "meshid:" .. id then
+        return true, leftToyPart, CFrame.new()
+    end
+    if options.rightToy == "meshid:" .. id then
+        return true, rightToyPart, CFrame.new()
+    end
+    return false
+end
+
+-- Find by Hat Name
+local function findHatName(name)
+    for k, v in pairs(headhats) do
+        if k == name then
+            return true, headPart, v
+        end
+    end
+    if rightHat == name then
+        return true, rightHandPart, CFrame.new()
+    end
+    if leftHat == name then
+        return true, leftHandPart, CFrame.new()
+    end
+    if options.leftToy == name then
+        return true, leftToyPart, CFrame.new()
+    end
+    if options.rightToy == name then
+        return true, rightToyPart, CFrame.new()
+    end
+    return false
+end
+
+-- Align Handle to Target
+local function Align(handle, targetPart, offsetCF)
     local con
-
-    con = RunService.PostSimulation:Connect(function()
-        if not handle.Parent or not IsNetworkOwner(handle) then return end
+    con = PostSimulation:Connect(function()
+        if not handle or not handle:IsDescendantOf(Workspace) then
+            con:Disconnect()
+            return
+        end
+        if handle.ReceiveAge ~= 0 then
+            return
+        end
         handle.CanCollide = false
-        handle.CFrame = alignPart.CFrame * offsetCF
-        handle.Velocity = velocity
+        handle.CFrame = targetPart.CFrame * (offsetCF or CFrame.new())
+        handle.Velocity = options.NetVelocity
+        handle.RotVelocity = Vector3.new()
     end)
-
-    return {
-        SetVelocity = function(v) velocity = v end,
-        SetCFrame = function(cf) offsetCF = cf end,
-        Disconnect = function() con:Disconnect() end
-    }
 end
 
--- === Hat dropping (fixed position) ===
-local function DropHats(character, callback)
-    local hrp = character:WaitForChild("HumanoidRootPart")
+-- Get all matching hats/accessories
+local function getAllHats(character)
+    local allHats = {}
+    local foundMeshIds = {}
+    for _, acc in pairs(character.Humanoid:GetAccessories()) do
+        if not acc:FindFirstChild("Handle") then
+            continue
+        end
+        local handle = acc.Handle
+        local mesh = handle:FindFirstChildOfClass("SpecialMesh")
+        local meshId = ""
+        if mesh then
+            meshId = filterMeshID(mesh.MeshId)
+        end
+        local isMatch, destPart, cf = findMeshID(meshId)
+        local key = "meshid:" .. meshId
+        if foundMeshIds[key] then
+            isMatch = false
+        else
+            foundMeshIds[key] = true
+        end
+        if isMatch then
+            table.insert(allHats, {acc = acc, handle = handle, dest = destPart, cf = cf})
+        else
+            isMatch, destPart, cf = findHatName(acc.Name)
+            if isMatch then
+                table.insert(allHats, {acc = acc, handle = handle, dest = destPart, cf = cf})
+            end
+        end
+    end
+    return allHats
+end
+
+-- Hat Drop & Align
+local function HatdropCallback(character, alignCallback)
     local humanoid = character:WaitForChild("Humanoid")
+    local hrp = character:WaitForChild("HumanoidRootPart")
+    task.wait(0.4)
 
-    local startY = hrp.Position.Y
-    local dropY = startY - 20  -- Drop just below feet
-
-    -- Freeze animation
     local anim = Instance.new("Animation")
     anim.AnimationId = "rbxassetid://35154961"
     local track = humanoid.Animator:LoadAnimation(anim)
@@ -95,140 +187,165 @@ local function DropHats(character, callback)
     track.TimePosition = 3.24
     track:AdjustSpeed(0)
 
-    -- Lock accessories
+    local allHats = getAllHats(character)
     local locks = {}
-    for _, acc in pairs(humanoid:GetAccessories()) do
-        table.insert(locks, acc.Changed:Connect(function(prop)
+
+    -- Set BackendState=2 on matching hats to prepare drop
+    for _, data in pairs(allHats) do
+        table.insert(locks, data.acc.Changed:Connect(function(prop)
             if prop == "BackendAccoutrementState" then
-                pcall(sethiddenproperty, acc, "BackendAccoutrementState", 0)
+                sethiddenproperty(data.acc, "BackendAccoutrementState", 0)
             end
         end))
-        pcall(sethiddenproperty, acc, "BackendAccoutrementState", 2)
+        sethiddenproperty(data.acc, "BackendAccoutrementState", 2)
     end
 
-    -- Hold position slightly below
+    -- Hold position low
     local holdCon
-    holdCon = RunService.Heartbeat:Connect(function()
-        if not hrp.Parent then holdCon:Disconnect() return end
-        hrp.CFrame = CFrame.new(hrp.Position.X, dropY, hrp.Position.Z)
-        hrp.Velocity = Vector3.new(0, 40, 0)
+    holdCon = PostSimulation:Connect(function()
+        if not character:FindFirstChild("HumanoidRootPart") then
+            holdCon:Disconnect()
+            return
+        end
+        hrp.Velocity = Vector3.new(0, 25, 0)
         hrp.RotVelocity = Vector3.new()
+        hrp.CFrame = CFrame.new(hrp.Position.X, Workspace.FallenPartsDestroyHeight + 0.25, hrp.Position.Z) * CFrame.Angles(math.rad(90), 0, 0)
     end)
 
-    task.wait(0.4)
-    callback()
+    task.wait(0.25)
 
-    humanoid:ChangeState(Enum.HumanoidStateType.Dead)
-    character:WaitForChild("Head").Anchored = false  -- Trigger detach
-
-    -- Unlock and drop
-    for _, lock in locks do lock:Disconnect() end
-    for _, acc in pairs(humanoid:GetAccessories()) do
-        pcall(sethiddenproperty, acc, "BackendAccoutrementState", 4)
+    -- Break joints to detach
+    for _, data in pairs(allHats) do
+        data.handle:BreakJoints()
+        -- Initial velocity push
+        local tempCon
+        tempCon = PostSimulation:Connect(function()
+            if not data.handle.Parent then
+                tempCon:Disconnect()
+                return
+            end
+            data.handle.Velocity = options.NetVelocity
+            data.handle.RotVelocity = Vector3.new()
+        end)
+        task.delay(0.1, function() tempCon:Disconnect() end)
     end
 
+    -- Align
+    alignCallback(allHats)
+
+    humanoid:ChangeState(Enum.HumanoidStateType.Dead)
+
+    -- Wait death
+    local torso = character:FindFirstChild("Torso") or character:FindFirstChild("LowerTorso")
+    if torso then
+        torso.AncestryChanged:Wait()
+    end
+
+    -- Cleanup
+    for _, lock in pairs(locks) do
+        lock:Disconnect()
+    end
+    for _, data in pairs(allHats) do
+        sethiddenproperty(data.acc, "BackendAccoutrementState", 4)
+    end
     holdCon:Disconnect()
 end
 
--- === Find matching hats ===
-local function GetMatchingHats(character)
-    local hats = {}
-    local usedMeshIds = {}
-
-    for _, acc in pairs(character:GetChildren()) do
-        if not acc:IsA("Accessory") then continue end
-        local handle = acc:FindFirstChild("Handle")
-        if not handle or not handle:FindFirstChildOfClass("SpecialMesh") then continue end
-
-        local mesh = handle.SpecialMesh
-        local meshId = tostring(mesh.MeshId:match("%d+"))
-        local key = "meshid:" .. meshId
-
-        local category, offset
-        if getgenv().headhats[key] then
-            category = "headhats"
-            offset = getgenv().headhats[key]
-        elseif getgenv().left == key or getgenv().left == acc.Name then
-            category = "left"
-            offset = CFrame.new()
-        elseif getgenv().right == key or getgenv().right == acc.Name then
-            category = "right"
-            offset = CFrame.new()
-        end
-
-        if category and not usedMeshIds[key] and not usedMeshIds[acc.Name] then
-            usedMeshIds[key] = true
-            usedMeshIds[acc.Name] = true
-            table.insert(hats, {acc, category, offset or CFrame.new()})
-        end
-    end
-    return hats
-end
-
--- === VR Controller Tracking ===
+-- VR Input
 Camera.CameraType = Enum.CameraType.Scriptable
-local rightAlign = nil
-local R1Down, R2Down = false, false
+Camera.HeadScale = options.headscale
+StarterGui:SetCore("VREnableControllerModels", false)
 
-UserInputService.UserCFrameChanged:Connect(function(part, cf)
-    local scaleOffset = CFrame.new(cf.Position * (Camera.HeadScale - 1)) * cf
+UserInputService.UserCFrameChanged:Connect(function(part, ucf)
+    Camera.CameraType = Enum.CameraType.Scriptable
+    Camera.HeadScale = options.headscale
+    local speedMult = options.movementSpeed or 1
+    local scaleOffset = CFrame.new(ucf.Position * (Camera.HeadScale - 1) * speedMult) * ucf
     if part == Enum.UserCFrame.Head then
-        HeadPart.CFrame = Camera.CFrame * scaleOffset
+        headPart.CFrame = Camera.CFrame * scaleOffset
     elseif part == Enum.UserCFrame.LeftHand then
-        LeftHandPart.CFrame = Camera.CFrame * scaleOffset * CFrame.Angles(math.rad(options.lefthandrotoffset.X), math.rad(options.lefthandrotoffset.Y), math.rad(options.lefthandrotoffset.Z))
-        if leftToyEnabled then LeftToyPart.CFrame = LeftHandPart.CFrame * leftToyCF end
+        leftHandPart.CFrame = Camera.CFrame * scaleOffset * CFrame.Angles(
+            math.rad(options.lefthandrotoffset.X),
+            math.rad(options.lefthandrotoffset.Y),
+            math.rad(options.lefthandrotoffset.Z)
+        )
+        if leftToyEnabled then
+            leftToyPart.CFrame = leftHandPart.CFrame * lToyPos
+        end
     elseif part == Enum.UserCFrame.RightHand then
-        RightHandPart.CFrame = Camera.CFrame * scaleOffset * CFrame.Angles(math.rad(options.righthandrotoffset.X), math.rad(options.righthandrotoffset.Y), math.rad(options.righthandrotoffset.Z))
-        if rightToyEnabled then RightToyPart.CFrame = RightHandPart.CFrame * rightToyCF end
+        rightHandPart.CFrame = Camera.CFrame * scaleOffset * CFrame.Angles(
+            math.rad(options.righthandrotoffset.X),
+            math.rad(options.righthandrotoffset.Y),
+            math.rad(options.righthandrotoffset.Z)
+        )
+        if rightToyEnabled then
+            rightToyPart.CFrame = rightHandPart.CFrame * rToyPos
+        end
     end
 end)
 
-UserInputService.InputBegan:Connect(function(input)
-    if input.KeyCode == options.leftToyBind then
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    local kc = input.KeyCode
+    if kc == options.leftToyBind then
+        if not lFirst then
+            lToyPos = leftToyPart.CFrame:ToObjectSpace(leftHandPart.CFrame):Inverse()
+        end
+        lFirst = false
         leftToyEnabled = not leftToyEnabled
-    elseif input.KeyCode == options.rightToyBind then
+    elseif kc == options.rightToyBind then
+        if not rFirst then
+            rToyPos = rightToyPart.CFrame:ToObjectSpace(rightHandPart.CFrame):Inverse()
+        end
+        rFirst = false
         rightToyEnabled = not rightToyEnabled
-    elseif input.KeyCode == Enum.KeyCode.ButtonR1 then
-        R1Down = true
-    elseif input.KeyCode == Enum.KeyCode.ButtonR2 then
-        R2Down = true
+    elseif kc == Enum.KeyCode.ButtonR1 then
+        R1down = true
     end
 end)
 
 UserInputService.InputEnded:Connect(function(input)
-    if input.KeyCode == Enum.KeyCode.ButtonR1 then R1Down = false end
-    if input.KeyCode == Enum.KeyCode.ButtonR2 then R2Down = false end
-end)
-
-RunService.RenderStepped:Connect(function()
-    if R1Down and RightHandPart then
-        Camera.CFrame = Camera.CFrame:Lerp(RightHandPart.CFrame * CFrame.Angles(math.rad(options.righthandrotoffset.X), math.rad(options.righthandrotoffset.Y), math.rad(options.righthandrotoffset.Z)), 0.5)
-    end
-
-    if rightAlign then
-        if R2Down then
-            rightAlign:SetVelocity(Vector3.new(0, 0, -999999))
-        else
-            rightAlign:SetVelocity(Vector3.new(20, 20, 20))
-        end
+    local kc = input.KeyCode
+    if kc == Enum.KeyCode.ButtonR1 then
+        R1down = false
     end
 end)
 
--- === Drop and align hats ===
-local function SetupHats(character)
-    DropHats(character, function()
-        task.wait(0.5)
-        for _, data in GetMatchingHats(character) do
-            local acc, cat, offset = data[1], data[2], data[3]
-            local handle = acc:FindFirstChild("Handle")
-            if handle then
-                if cat == "headhats" then handle.Transparency = options.HeadHatTransparency end
-                local aligner = Align(handle, parts[cat], offset)
-                if cat == "right" then rightAlign = aligner end
+-- Locomotion (Right hand thumbstick analog? R1 hold)
+RenderStepped:Connect(function()
+    if R1down then
+        local controllerOff = options.controllerRotationOffset
+        local rightOff = options.righthandrotoffset
+        local locoSmooth = options.locomotionSmoothing or 0.5
+        local locoSpeed = options.locomotionSpeed or 0.5
+        local moveDir = (rightHandPart.CFrame * CFrame.Angles(
+            math.rad(controllerOff.X - rightOff.X),
+            math.rad(controllerOff.Y - rightOff.Y),
+            math.rad(controllerOff.Z - rightOff.Z)
+        )).LookVector * (Camera.HeadScale / 2) * locoSpeed
+        Camera.CFrame = Camera.CFrame:Lerp(Camera.CFrame + moveDir, locoSmooth)
+    end
+end)
+
+-- Initial & Respawn
+local function alignHats(allHats)
+    for _, data in pairs(allHats) do
+        if data.handle and data.handle.Parent then
+            if data.dest == headPart then
+                data.handle.Transparency = options.HeadHatTransparency
             end
+            Align(data.handle, data.dest, data.cf)
         end
-    end)
+    end
 end
 
-if Player.Character then SetupHats(Player.Character) end
-Player.CharacterAdded:Connect(SetupHats)
+if Player.Character then
+    HatdropCallback(Player.Character, alignHats)
+end
+
+Player.CharacterAdded:Connect(function(char)
+    task.wait(0.35)
+    HatdropCallback(Player.Character, alignHats)
+end)
+
+print("SkyVR Hatdrop Fixed - Loaded Successfully!")
